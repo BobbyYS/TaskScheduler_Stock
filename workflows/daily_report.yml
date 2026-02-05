@@ -1,0 +1,30 @@
+name: Stock Strategy Report
+
+on:
+  schedule:
+    # 台北時間週一至週五 16:30 (UTC 08:30)
+    - cron: '40 2 * * 1-5'
+  workflow_dispatch: # 允許手動執行
+
+jobs:
+  run-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install yfinance pandas twstock tqdm lxml
+
+      - name: Run Main Script
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        run: python main.py
