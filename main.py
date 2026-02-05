@@ -14,10 +14,11 @@ from email.mime.multipart import MIMEMultipart
 MY_PORTFOLIO = {
     '4939.TW': {'cost': 51.2, 'stop_loss_pct': 0.07},  # 亞電
     '3346.TW': {'cost': 50.8, 'stop_loss_pct': 0.07},  # 麗清
-    '2492.TW': {'cost': 133.5, 'stop_loss_pct': 0.07} # 華新科
+    '2492.TW': {'cost': 133.5, 'stop_loss_pct': 0.07}, # 華新科
+    '2317.TW': {'cost': 227.2, 'stop_loss_pct': 0.07}  # 鴻海
 }
 
-# 環境變數由 GitHub Secrets 提供
+# 環境變數 (GitHub Secrets)
 GMAIL_USER = os.environ.get('GMAIL_USER')
 GMAIL_APP_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD')
 RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL')
@@ -25,7 +26,6 @@ RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL')
 class StockSystem:
     def __init__(self):
         self.bench_ticker = '0050.TW'
-        # 篩選參數彙整
         self.min_price = 20
         self.min_volume_chose = 800000
         self.min_volume_drive = 1000000
@@ -33,191 +33,206 @@ class StockSystem:
         self.rs_period_drive = 60
 
     def get_benchmark_roc(self, period):
-        """獲取大盤動能基準"""
         try:
             bench = yf.download(self.bench_ticker, period='1y', progress=False, auto_adjust=True)
             close = bench['Close'].iloc[:, 0] if isinstance(bench['Close'], pd.DataFrame) else bench['Close']
             return float(close.pct_change(period).iloc[-1])
         except: return 0
 
-    def health_check_logic(self, ticker, data, df):
-        """移植自 health.py 的健檢邏輯"""
+    def health_check_logic(self, ticker, name, data, df):
+        """完全移植考特賣出法則"""
         try:
             close = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
             curr = float(close.iloc[-1])
             cost = data['cost']
             init_risk_pct = data['stop_loss_pct']
             init_risk_amt = cost * init_risk_pct
-            
             pnl_amt = curr - cost
             r_multiple = pnl_amt / init_risk_amt
             
             ma10 = float(close.rolling(10).mean().iloc[-1])
             ma20 = float(close.rolling(20).mean().iloc[-1])
             
-            action = "✅ 續抱"
-            reason = []
+            action, reason = "✅ 續抱", []
             hard_stop = cost * (1 - init_risk_pct)
             
-            # 邏輯判定
             if curr < hard_stop:
-                action = "🛑 停損"
+                action = "🛑 清倉賣出(停損)"
                 reason.append(f"跌破初始停損 {round(hard_stop, 2)}")
             elif r_multiple >= 2:
-                if curr < cost:
-                    action = "🛑 保本賣出"
-                    reason.append("獲利回吐觸及成本")
-                else: reason.append(f"獲利 {round(r_multiple,1)}R，保本防守")
+                if curr < cost: action = "🛑 清倉賣出(保本)"; reason.append("獲利回吐觸及成本")
+                else: reason.append(f"達2R({round(r_multiple,1)}R)啟動保本")
             
             is_super = (close.iloc[-35:] > close.rolling(10).mean().iloc[-35:]).all()
             check_ma = ma10 if is_super else ma20
             if curr < check_ma:
                 action = "⚠️ 警戒/賣出"
-                reason.append(f"跌破 {'10MA' if is_super else '20MA'}")
-
-            return {
-                "代號": ticker, "現價": round(curr, 2), "獲利(R)": f"{round(r_multiple, 1)}R",
-                "建議動作": action, "診斷原因": " | ".join(reason)
-            }
+                reason.append(f"跌破{'10MA' if is_super else '20MA'}")
+            
+            return {"代號": ticker, "名稱": name, "現價": round(curr, 2), "獲利(R)": f"{round(r_multiple, 1)}R", "建議動作": action, "防守價": round(max(hard_stop, check_ma), 2), "原因": " | ".join(reason)}
         except: return None
 
     def analyze_chose(self, ticker, name, df, bench_roc):
-        """移植自 chose.py 的選股邏輯"""
+        """全量移植買入型態判斷"""
         try:
             close = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
             high = df['High'].iloc[:, 0] if isinstance(df['High'], pd.DataFrame) else df['High']
             vol = df['Volume'].iloc[:, 0] if isinstance(df['Volume'], pd.DataFrame) else df['Volume']
+            open_p = df['Open'].iloc[:, 0] if isinstance(df['Open'], pd.DataFrame) else df['Open']
             
-            curr = float(close.iloc[-1])
-            avg_vol = float(vol.rolling(20).mean().iloc[-1])
-            
+            curr, avg_vol = float(close.iloc[-1]), float(vol.rolling(20).mean().iloc[-1])
             if curr < self.min_price or avg_vol < self.min_volume_chose: return None
             
             ma50, ma200 = float(close.rolling(50).mean().iloc[-1]), float(close.rolling(200).mean().iloc[-1])
             if not (curr > ma50 > ma200): return None
             
             stock_roc = float(close.pct_change(self.rs_period_chose).iloc[-1])
-            if stock_roc < bench_roc: return None
+            rs_rating = (stock_roc - bench_roc) * 100
+            if rs_rating < 0: return None
             
-            # 型態辨識 (HTF/VCP)
             year_high = float(high.iloc[-250:].max())
             prev_20_high = float(high.iloc[-21:-1].max())
             is_breakout = (curr > prev_20_high) and (close.iloc[-2] < prev_20_high)
             
-            if is_breakout and (year_high - curr)/year_high < 0.15:
-                return {"代號": ticker, "名稱": name, "現價": round(curr, 2), "型態": "VCP/箱型突破", "RS": round((stock_roc-bench_roc)*100, 1)}
+            setup, reason = "", ""
+            # 高窄旗型
+            rally = (high.iloc[-60:].max() - close.iloc[-60:].min())/close.iloc[-60:].min()
+            if rally > 0.8 and (year_high-curr)/year_high < 0.25 and is_breakout:
+                setup, reason = "🚀 高窄旗型", "飆漲動能突破"
+            # 買進跳空
+            elif (open_p.iloc[-1] - close.iloc[-2])/close.iloc[-2] > 0.08:
+                setup, reason = "🕳️ 買進跳空", "強力消息缺口"
+            # VCP 突破
+            elif is_breakout and (year_high - curr)/year_high < 0.15:
+                setup, reason = "📦 VCP突破", "整理區帶量突破"
+
+            if setup:
+                return {"代號": ticker, "名稱": name, "現價": round(curr, 2), "型態": setup, "RS": round(rs_rating, 1), "建議買價": round(prev_20_high, 2), "買入原因": reason}
             return None
         except: return None
 
-    def analyze_drive(self, info, df, bench_roc):
-        """移植自 drive.py 的 DRIVE 邏輯"""
+    def analyze_drive(self, item, df, bench_roc):
+        """全量移植 DRIVE 深度評分"""
         try:
             close = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
+            high = df['High'].iloc[:, 0] if isinstance(df['High'], pd.DataFrame) else df['High']
+            low = df['Low'].iloc[:, 0] if isinstance(df['Low'], pd.DataFrame) else df['Low']
             vol = df['Volume'].iloc[:, 0] if isinstance(df['Volume'], pd.DataFrame) else df['Volume']
-            curr = float(close.iloc[-1])
-            avg_vol = float(vol.rolling(20).mean().iloc[-1])
             
+            curr, avg_vol = float(close.iloc[-1]), float(vol.rolling(20).mean().iloc[-1])
             if curr < self.min_price or avg_vol < self.min_volume_drive: return None
             
+            ma50, ma200 = float(close.rolling(50).mean().iloc[-1]), float(close.rolling(200).mean().iloc[-1])
+            year_high, year_low = float(high.iloc[-250:].max()), float(low.iloc[-250:].min())
+            if not (curr > ma50 > ma200 and (year_high - curr)/year_high < 0.25): return None
+
             stock_roc = float(close.pct_change(self.rs_period_drive).iloc[-1])
             rs_rating = (stock_roc - bench_roc) * 100
             if rs_rating < 5: return None
-            
-            # MVP 邏輯
+
+            # MVP 邏輯：15天內收紅>=9天 + 成交量比前段放大
             up_days = (close.iloc[-16:-1].diff() > 0).sum()
-            is_mvp = up_days >= 9
+            vol_ratio = vol.iloc[-16:-1].mean() / vol.iloc[-31:-16].mean()
+            is_mvp = up_days >= 9 and vol_ratio >= 1.2
             
-            if is_mvp:
-                return {"代號": info['ticker'], "名稱": info['name'], "產業": info['industry'], "評分": "🔥MVP大戶吸籌", "RS": round(rs_rating, 1)}
+            score, comments = 0, []
+            prev_20_high = float(close.iloc[-21:-1].max())
+            if curr > prev_20_high and vol.iloc[-1] > avg_vol * 1.3:
+                score += 50; comments.append("樞紐突破")
+            if is_mvp: score += 30; comments.append("🔥MVP吸籌")
+            if rs_rating > 30: score += 20; comments.append("超強RS")
+
+            if score >= 30:
+                return {"代號": item['ticker'], "名稱": item['name'], "產業": item['industry'], "評分": score, "RS": round(rs_rating, 1), "吸籌特徵": " + ".join(comments)}
             return None
         except: return None
 
     def run(self):
-        # 初始化數據
-        print("📋 正在抓取市場清單...")
         codes = twstock.codes
-        all_stocks = [{'ticker': c + ('.TW' if r.market == '上市' else '.TWO'), 'name': r.name, 'industry': r.group} 
-                      for c, r in codes.items() if r.type == '股票']
-        
-        bench_roc_c = self.get_benchmark_roc(self.rs_period_chose)
-        bench_roc_d = self.get_benchmark_roc(self.rs_period_drive)
-        
+        all_stocks = [{'ticker': c+('.TW' if r.market=='上市' else '.TWO'), 'name': r.name, 'industry': r.group} for c,r in codes.items() if r.type=='股票']
+        bench_c, bench_d = self.get_benchmark_roc(20), self.get_benchmark_roc(60)
         res_h, res_c, res_d = [], [], []
-
-        print(f"🚀 開始分析 {len(all_stocks)} 檔股票...")
+        print(f"🚀 全力掃描 {len(all_stocks)} 檔標的...")
         for item in tqdm(all_stocks):
-            ticker = item['ticker']
             try:
-                # 每個代號只下載一次資料 (取1年確保MA200正確)
-                df = yf.download(ticker, period='1y', progress=False, auto_adjust=True)
+                df = yf.download(item['ticker'], period='1y', progress=False, auto_adjust=True)
                 if df.empty or len(df) < 200: continue
-
-                # 1. 如果在清單內，執行健檢
-                if ticker in MY_PORTFOLIO:
-                    h = self.health_check_logic(ticker, MY_PORTFOLIO[ticker], df)
+                if item['ticker'] in MY_PORTFOLIO:
+                    h = self.health_check_logic(item['ticker'], item['name'], MY_PORTFOLIO[item['ticker']], df)
                     if h: res_h.append(h)
-                
-                # 2. 執行選股掃描
-                c = self.analyze_chose(ticker, item['name'], df, bench_roc_c)
+                c = self.analyze_chose(item['ticker'], item['name'], df, bench_c)
                 if c: res_c.append(c)
-                
-                d = self.analyze_drive(item, df, bench_roc_d)
+                d = self.analyze_drive(item, df, bench_d)
                 if d: res_d.append(d)
             except: continue
-        
         return res_h, res_c, res_d
 
 # ==========================================
-# 📧 郵件發送與 HTML 格式化
+# 📧 郵件發送與 AI 深度診斷文字引擎
 # ==========================================
+def generate_ai_diagnostic(row_c, row_d):
+    """根據量化數據產出 AI 深度點評文字"""
+    diagnostic = (
+        f"<b>【{row_c['名稱']} ({row_c['代號'].split('.')[0]})】</b><br>"
+        f"➡️ <b>診斷結論：</b> 該股觸發了 <b>{row_c['型態']}</b>，顯示出極強的買入契機。其 DRIVE 綜合評分高達 <b>{row_d['評分']} 分</b>，"
+        f"RS 強度達 <b>{row_d['RS']}</b>，不僅強於大盤，更是 {row_d['產業']} 板塊中的領頭羊。 "
+        f"技術面具備 <b>{row_d['吸籌特徵']}</b>，大戶吸籌跡象明顯，建議在 <b>{row_c['建議買價']}</b> 附近分批佈局。<br><br>"
+    )
+    return diagnostic
+
 def send_email(h, c, d):
     df_h, df_c, df_d = pd.DataFrame(h), pd.DataFrame(c), pd.DataFrame(d)
     
-    # 計算綜合結果 (交集)
-    set_c = set(df_c['代號']) if not df_c.empty else set()
-    set_d = set(df_d['代號']) if not df_d.empty else set()
-    inter_list = list(set_c & set_d)
-    df_inter = pd.concat([df_c[df_c['代號'].isin(inter_list)], df_d[df_d['代號'].isin(inter_list)]]).drop_duplicates('代號')
+    # 產業分析與雙重認證個股
+    top_ind = df_d['產業'].value_counts().head(3).index.tolist() if not df_d.empty else []
+    ai_section = ""
+    if not df_c.empty and not df_d.empty:
+        inter_ids = list(set(df_c['代號']) & set(df_d['代號']))
+        for tid in inter_ids:
+            row_c = df_c[df_c['代號'] == tid].iloc[0]
+            row_d = df_d[df_d['代號'] == tid].iloc[0]
+            ai_section += generate_ai_diagnostic(row_c, row_d)
 
     style = """
     <style>
-        .title { background: #2c3e50; color: white; padding: 10px; margin-top: 20px; font-weight: bold; }
-        .table { border-collapse: collapse; width: 100%; font-family: sans-serif; margin-bottom: 20px; }
+        body { font-family: sans-serif; line-height: 1.6; color: #333; }
+        .title { background: #2c3e50; color: white; padding: 12px; margin-top: 25px; font-weight: bold; border-radius: 5px; }
+        .ai-box { background: #fffcf0; border: 1px solid #f1c40f; border-left: 6px solid #f1c40f; padding: 15px; margin: 15px 0; font-size: 14px; color: #7f8c8d; }
+        .table { border-collapse: collapse; width: 100%; font-size: 13px; margin-bottom: 20px; }
         .table th, .table td { border: 1px solid #ddd; padding: 10px; text-align: left; }
         .table th { background-color: #f8f9fa; }
-        .highlight { background-color: #fff3cd; color: #856404; font-weight: bold; }
     </style>
     """
     
     html = f"<html><head>{style}</head><body>"
-    html += "<h2>📈 每日台股策略報告</h2>"
+    html += f"<h2>📈 台股動能投資策略報告 ({pd.Timestamp.now().strftime('%Y-%m-%d')})</h2>"
+    html += f"<p>💰 本日主流板塊：{', '.join(top_ind)}</p>"
     
-    html += "<div class='title'>🏥 庫存健檢報告</div>"
-    html += df_h.to_html(classes='table', index=False) if not df_h.empty else "<p>無庫存數據</p>"
+    html += "<div class='title'>1. 🏥 庫存健檢 (考特賣出法則)</div>"
+    html += df_h.to_html(classes='table', index=False) if not df_h.empty else "<p>無庫存資料</p>"
 
-    html += "<div class='title' style='background:#d9534f;'>🔥 綜合最強訊號 (DRIVE & CHOSE 雙重認證)</div>"
-    html += df_inter.to_html(classes='table', index=False) if not df_inter.empty else "<p>今日無雙重認證訊號</p>"
+    html += "<div class='title' style='background:#8e44ad;'>4. 💎 雙重認證個股深度分析 (AI 診斷)</div>"
+    if ai_section:
+        html += f"<div class='ai-box'>{ai_section}</div>"
+    else:
+        html += "<div class='ai-box'>今日無雙重認證標的，大盤可能處於盤整期，請謹慎持倉。</div>"
 
-    html += "<div class='title'>🚀 買入型態掃描 (CHOSE - VCP/高窄旗型)</div>"
-    html += df_c.to_html(classes='table', index=False) if not df_c.empty else "<p>今日無訊號</p>"
+    html += "<div class='title'>2. 🚀 買入型態掃描 (CHOSE)</div>"
+    html += df_c.to_html(classes='table', index=False) if not df_c.empty else "<p>今日無符合標的</p>"
 
-    html += "<div class='title'>👑 終極大戶動能 (DRIVE - MVP/板塊)</div>"
-    html += df_d.to_html(classes='table', index=False) if not df_d.empty else "<p>今日無訊號</p>"
+    html += "<div class='title'>3. 👑 大戶動能評分 (DRIVE)</div>"
+    html += df_d.to_html(classes='table', index=False) if not df_d.empty else "<p>今日無高動能標的</p>"
     
     html += "</body></html>"
 
-    msg = MIMEMultipart()
-    msg['Subject'] = f"台股策略報告 - {pd.Timestamp.now().strftime('%Y-%m-%d')}"
-    msg['From'] = GMAIL_USER
-    msg['To'] = RECEIVER_EMAIL
+    msg = MIMEMultipart(); msg['Subject'] = f"台股策略報告 - {pd.Timestamp.now().strftime('%Y-%m-%d')}"
+    msg['From'], msg['To'] = GMAIL_USER, RECEIVER_EMAIL
     msg.attach(MIMEText(html, 'html'))
-
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        server.send_message(msg)
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as s:
+        s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        s.send_message(msg)
 
 if __name__ == "__main__":
     system = StockSystem()
     h, c, d = system.run()
-    send_email(h, c, d)
-    print("Done!")
+    send_email(h, c, d); print("Done!")
