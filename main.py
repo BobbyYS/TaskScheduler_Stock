@@ -167,11 +167,89 @@ class StockSystem:
             except: continue
         return res_h, res_c, res_d
 
+
+# ==========================================
+# 📊 策略回測引擎 (100% 同步進出場邏輯)
+# ==========================================
+def backtest_3y_strategy(ticker, bench_roc_series):
+    try:
+        # 抓取 4 年數據確保計算 MA200 無誤
+        df = yf.download(ticker, period='4y', progress=False, auto_adjust=True)
+        if df.empty or len(df) < 300: return 0, 0
+        
+        c_series = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
+        h_series = df['High'].iloc[:, 0] if isinstance(df['High'], pd.DataFrame) else df['High']
+        l_series = df['Low'].iloc[:, 0] if isinstance(df['Low'], pd.DataFrame) else df['Low']
+        o_series = df['Open'].iloc[:, 0] if isinstance(df['Open'], pd.DataFrame) else df['Open']
+        v_series = df['Volume'].iloc[:, 0] if isinstance(df['Volume'], pd.DataFrame) else df['Volume']
+
+        ma10 = c_series.rolling(10).mean()
+        ma20 = c_series.rolling(20).mean()
+        ma50 = c_series.rolling(50).mean()
+        ma200 = c_series.rolling(200).mean()
+        avg_vol_20 = v_series.rolling(20).mean()
+        
+        trades = []
+        in_pos = False
+        entry_p = 0
+        init_stop_pct = 0.07 
+
+        # 模擬過去 3 年的每日交易
+        start_idx = len(df) - 750
+        for i in range(start_idx, len(df)):
+            curr_c = float(c_series.iloc[i])
+            dt = df.index[i]
+            
+            if not in_pos:
+                # --- 進場：analyze_chose 邏輯 ---
+                if curr_c < 20 or avg_vol_20.iloc[i] < 800000: continue
+                if not (curr_c > ma50.iloc[i] > ma200.iloc[i]): continue
+                
+                s_roc = float(c_series.iloc[i] / c_series.iloc[i-20] - 1)
+                if (s_roc - bench_roc_series.get(dt, 0)) < 0: continue
+                
+                y_high = float(h_series.iloc[i-250:i].max())
+                p20_high = float(h_series.iloc[i-21:i].max())
+                is_break = (curr_c > p20_high) and (c_series.iloc[i-1] < p20_high)
+                
+                rally = (h_series.iloc[i-60:i].max() - c_series.iloc[i-60:i].min()) / c_series.iloc[i-60:i].min()
+                is_flag = rally > 0.8 and (y_high - curr_c)/y_high < 0.25 and is_break
+                is_gap = (o_series.iloc[i] - c_series.iloc[i-1])/c_series.iloc[i-1] > 0.08
+                is_vcp = is_break and (y_high - curr_c)/y_high < 0.15
+                
+                if is_flag or is_gap or is_vcp:
+                    entry_p = curr_c
+                    in_pos = True
+            
+            elif in_pos:
+                # --- 出場：health_check_logic 邏輯 ---
+                r_mult = (curr_c - entry_p) / (entry_p * init_stop_pct)
+                is_super = (c_series.iloc[i-34:i+1] > ma10.iloc[i-34:i+1]).all()
+                check_ma = ma10.iloc[i] if is_super else ma20.iloc[i]
+                
+                exit_now = False
+                if curr_c < entry_p * (1 - init_stop_pct): exit_now = True
+                elif r_mult >= 2 and curr_c < entry_p: exit_now = True
+                elif curr_c < check_ma: exit_now = True
+                
+                if exit_now:
+                    trades.append((curr_c - entry_p) / entry_p)
+                    in_pos = False
+        
+        if not trades: return 0, 0
+        wr = len([t for t in trades if t > 0]) / len(trades) * 100
+        tr = (np.prod([1 + t for t in trades]) - 1) * 100
+        return round(wr, 1), round(tr, 1)
+    except: return 0, 0
+        
 # ==========================================
 # 📧 郵件發送與 AI 深度診斷文字引擎
 # ==========================================
-def generate_ai_diagnostic(row_c, row_d, df):
-    """根據量化數據產出 AI 深度點評文字，包含精確停損價格"""
+def generate_ai_diagnostic(row_c, row_d, df, bench_series):
+    """
+    根據量化數據產出 AI 深度點評文字
+    包含：原始診斷、精確停損、3年同步回測、績優生標記
+    """
     try:
         close = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
         
@@ -180,17 +258,30 @@ def generate_ai_diagnostic(row_c, row_d, df):
         init_stop = round(buy_price * 0.93, 2)  # 初始停損設為 -7%
         ma10 = round(float(close.rolling(10).mean().iloc[-1]), 2)
         ma20 = round(float(close.rolling(20).mean().iloc[-1]), 2)
+
+        # 2. 執行 3 年同步回測 (進場：analyze_chose | 出場：health_check_logic)
+        win_rate, cumulative_ret = backtest_3y_strategy(row_c['代號'], bench_series)
+
+        # 3. 歷史績優生判定 (勝率 > 60% 且報酬 > 50%)
+        star_tag = "<b style='color:#f1c40f;'>🌟 歷史績優生</b>" if win_rate >= 60 and cumulative_ret > 50 else ""
+
+        # 4. 判斷目前防線 (同步考特賣出法則之 MA 選擇)
+        is_super = (close.iloc[-35:] > close.rolling(10).mean().iloc[-35:]).all()
+        defense_ma_name = "10MA" if is_super else "20MA"
+        defense_ma_val = ma10_val if is_super else ma20_val
         
         diagnostic = (
-            f"<b>【{row_c['名稱']} ({row_c['代號'].split('.')[0]})】</b><br>"
+            f"<b>【{row_c['名稱']} ({row_c['代號'].split('.')[0]})】</b> {star_tag}<br>"
             f"➡️ <b>診斷結論：</b> 該股觸發了 <b>{row_c['型態']}</b>，顯示出極強的買入契機。其 DRIVE 綜合評分高達 <b>{row_d['評分']} 分</b>，"
             f"RS 強度達 <b>{row_d['RS']}</b>，不僅強於大盤，更是 {row_d['產業']} 板塊中的領頭羊。<br>"
+            f"📊 <b>策略回測 (3Y)：</b> 勝率 <b style='color:#27ae60;'>{win_rate}%</b> | 總報酬 <b style='color:#27ae60;'>{cumulative_ret}%</b><br>"
             f"✅ <b>技術特徵：</b> 具備 <b>{row_d['吸籌特徵']}</b>，大戶吸籌跡象明顯。<br>"
             f"📍 <b>佈局建議：</b> 建議在 <b>{buy_price}</b> 附近分批佈局。<br>"
-            f"🛡️ <b>風險控管 (停損預估)：</b><br>"
+            f"🛡️ <b>風險控控 (停損預估)：</b><br>"
             f"• 初始防禦 (觸發即撤)：<b>{init_stop}</b><br>"
-            f"• 強勢持有線 (10MA)：<b>{ma10}</b><br>"
-            f"• 最後防線 (20MA)：<b>{ma20}</b><br><br>"
+            f"• 強勢持有線 (10MA)：<b>{ma10_val}</b><br>"
+            f"• 最後防線 (20MA)：<b>{ma20_val}</b><br>"
+            f"💡 <b>當前防守重點：</b> 建議盯住 <b>{defense_ma_name} ({defense_ma_val})</b><br><br>"
             f"<hr style='border:0.5px dashed #ddd;'>"
         )
         return diagnostic
@@ -199,7 +290,11 @@ def generate_ai_diagnostic(row_c, row_d, df):
 
 def send_email(h, c, d):
     df_h, df_c, df_d = pd.DataFrame(h), pd.DataFrame(c), pd.DataFrame(d)
-    
+    # 回測所需的資料
+    bench_df = yf.download('0050.TW', period='4y', progress=False, auto_adjust=True)
+    b_close = bench_df['Close'].iloc[:, 0] if isinstance(bench_df['Close'], pd.DataFrame) else bench_df['Close']
+    bench_series = b_close.pct_change(20).to_dict()
+
     # 產業分析與雙重認證個股
     top_ind = df_d['產業'].value_counts().head(3).index.tolist() if not df_d.empty else []
     ai_section = ""
@@ -211,7 +306,7 @@ def send_email(h, c, d):
 
             # --- 為了獲取 MA 數值，這裡需重新下載該股數據或從主程式傳遞 ---
             df_temp = yf.download(tid, period='60d', progress=False, auto_adjust=True)
-            ai_section += generate_ai_diagnostic(row_c, row_d, df_temp)
+            ai_section += generate_ai_diagnostic(row_c, row_d, df_temp, bench_series)
 
     style = """
     <style>
@@ -257,3 +352,4 @@ if __name__ == "__main__":
     h, c, d = system.run()
 
     send_email(h, c, d); print("Done!")
+
