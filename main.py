@@ -245,44 +245,60 @@ def backtest_3y_strategy(ticker, bench_roc_series):
 # ==========================================
 # 📧 郵件發送與 AI 深度診斷文字引擎
 # ==========================================
-def generate_ai_diagnostic(row_c, row_d, df):
+def generate_ai_diagnostic(row_c, row_d, df, bench_series):
     """
     根據量化數據產出 AI 深度點評文字
-    包含：原始診斷、精確停損
+    包含：原始診斷、精確停損、3年同步回測、績優生標記
     """
     try:
+        # 確保數據不為空且列名正確
         close = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
         
-        # 計算各類停損價格
+        # 1. 計算各類停損價格 (修正變數名稱)
         buy_price = row_c['建議買價']
         init_stop = round(buy_price * 0.93, 2)  # 初始停損設為 -7%
         ma10 = round(float(close.rolling(10).mean().iloc[-1]), 2)
         ma20 = round(float(close.rolling(20).mean().iloc[-1]), 2)
-
-        #  判斷目前防線 (同步考特賣出法則之 MA 選擇)
-        is_super = (close.iloc[-35:] > close.rolling(10).mean().iloc[-35:]).all()
-        defense_ma_name = "10MA" if is_super else "20MA"
-        defense_ma_val = ma10_val if is_super else ma20_val
         
+        # 2. 執行 3 年同步回測
+        win_rate, cumulative_ret = backtest_3y_strategy(row_c['代號'], bench_series)
+        
+        # 3. 標記與防護邏輯
+        star_tag = "<b style='color:#f1c40f;'>🌟 歷史績優生</b>" if win_rate >= 60 and cumulative_ret > 50 else ""
+        is_super = (close.iloc[-35:] > close.rolling(10).mean().iloc[-35:]).all()
+        
+        defense_ma_name = "10MA" if is_super else "20MA"
+        defense_ma_val = ma10 if is_super else ma20
+
+        # 4. 組合 HTML 文字
         diagnostic = (
             f"<b>【{row_c['名稱']} ({row_c['代號'].split('.')[0]})】</b> {star_tag}<br>"
             f"➡️ <b>診斷結論：</b> 該股觸發了 <b>{row_c['型態']}</b>，顯示出極強的買入契機。其 DRIVE 綜合評分高達 <b>{row_d['評分']} 分</b>，"
             f"RS 強度達 <b>{row_d['RS']}</b>，不僅強於大盤，更是 {row_d['產業']} 板塊中的領頭羊。<br>"
+            f"📊 <b>策略回測 (3Y)：</b> 勝率 <b style='color:#27ae60;'>{win_rate}%</b> | 總報酬 <b style='color:#27ae60;'>{cumulative_ret}%</b><br>"
             f"✅ <b>技術特徵：</b> 具備 <b>{row_d['吸籌特徵']}</b>，大戶吸籌跡象明顯。<br>"
             f"📍 <b>佈局建議：</b> 建議在 <b>{buy_price}</b> 附近分批佈局。<br>"
-            f"🛡️ <b>風險控控 (停損預估)：</b><br>"
+            f"🛡️ <b>風險控管 (停損預估)：</b><br>"
             f"• 初始防禦 (觸發即撤)：<b>{init_stop}</b><br>"
-            f"• 強勢持有線 (10MA)：<b>{ma10_val}</b><br>"
-            f"• 最後防線 (20MA)：<b>{ma20_val}</b><br>"
+            f"• 強勢持有線 (10MA)：<b>{ma10}</b><br>"
+            f"• 最後防線 (20MA)：<b>{ma20}</b><br>"
             f"💡 <b>當前防守重點：</b> 建議盯住 <b>{defense_ma_name} ({defense_ma_val})</b><br><br>"
             f"<hr style='border:0.5px dashed #ddd;'>"
         )
         return diagnostic
-    except:
+    except Exception as e:
+        # 這裡打印錯誤，可以在 GitHub Actions 的 Log 中看到具體原因
+        print(f"Error analyzing {row_c['名稱']}: {e}")
         return f"【{row_c['名稱']}】數據解析異常，跳過診斷。<br>"
 
 def send_email(h, c, d):
     df_h, df_c, df_d = pd.DataFrame(h), pd.DataFrame(c), pd.DataFrame(d)
+
+    # --- 準備大盤數據字典用於回測 ---
+    print("正在準備回測大盤數據...")
+    bench_df = yf.download('0050.TW', period='4y', progress=False, auto_adjust=True)
+    bench_close = bench_df['Close'].iloc[:, 0] if isinstance(bench_df['Close'], pd.DataFrame) else bench_df['Close']
+    bench_series = bench_close.pct_change(20).to_dict()
 
     # 產業分析與雙重認證個股
     top_ind = df_d['產業'].value_counts().head(3).index.tolist() if not df_d.empty else []
@@ -293,9 +309,10 @@ def send_email(h, c, d):
             row_c = df_c[df_c['代號'] == tid].iloc[0]
             row_d = df_d[df_d['代號'] == tid].iloc[0]
 
-            # --- 為了獲取 MA 數值，這裡需重新下載該股數據或從主程式傳遞 ---
-            df_temp = yf.download(tid, period='60d', progress=False, auto_adjust=True)
-            ai_section += generate_ai_diagnostic(row_c, row_d, df_temp)
+            # 抓取較長的時間段以滿足回測需求 (3年回測需要4年數據以供MA計算)
+            df_temp = yf.download(tid, period='4y', progress=False, auto_adjust=True)
+            # 傳入正確的參數
+            ai_section += generate_ai_diagnostic(row_c, row_d, df_temp, bench_series)
 
     style = """
     <style>
@@ -341,5 +358,6 @@ if __name__ == "__main__":
     h, c, d = system.run()
 
     send_email(h, c, d); print("Done!")
+
 
 
