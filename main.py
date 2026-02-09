@@ -170,15 +170,32 @@ class StockSystem:
 # ==========================================
 # 📧 郵件發送與 AI 深度診斷文字引擎
 # ==========================================
-def generate_ai_diagnostic(row_c, row_d):
-    """根據量化數據產出 AI 深度點評文字"""
-    diagnostic = (
-        f"<b>【{row_c['名稱']} ({row_c['代號'].split('.')[0]})】</b><br>"
-        f"➡️ <b>診斷結論：</b> 該股觸發了 <b>{row_c['型態']}</b>，顯示出極強的買入契機。其 DRIVE 綜合評分高達 <b>{row_d['評分']} 分</b>，"
-        f"RS 強度達 <b>{row_d['RS']}</b>，不僅強於大盤，更是 {row_d['產業']} 板塊中的領頭羊。 "
-        f"技術面具備 <b>{row_d['吸籌特徵']}</b>，大戶吸籌跡象明顯，建議在 <b>{row_c['建議買價']}</b> 附近分批佈局。<br><br>"
-    )
-    return diagnostic
+def generate_ai_diagnostic(row_c, row_d, df):
+    """根據量化數據產出 AI 深度點評文字，包含精確停損價格"""
+    try:
+        close = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
+        
+        # 1. 計算各類停損價格
+        buy_price = row_c['建議買價']
+        init_stop = round(buy_price * 0.93, 2)  # 初始停損設為 -7%
+        ma10 = round(float(close.rolling(10).mean().iloc[-1]), 2)
+        ma20 = round(float(close.rolling(20).mean().iloc[-1]), 2)
+        
+        diagnostic = (
+            f"<b>【{row_c['名稱']} ({row_c['代號'].split('.')[0]})】</b><br>"
+            f"➡️ <b>診斷結論：</b> 該股觸發了 <b>{row_c['型態']}</b>，顯示出極強的買入契機。其 DRIVE 綜合評分高達 <b>{row_d['評分']} 分</b>，"
+            f"RS 強度達 <b>{row_d['RS']}</b>，不僅強於大盤，更是 {row_d['產業']} 板塊中的領頭羊。<br>"
+            f"✅ <b>技術特徵：</b> 具備 <b>{row_d['吸籌特徵']}</b>，大戶吸籌跡象明顯。<br>"
+            f"📍 <b>佈局建議：</b> 建議在 <b>{buy_price}</b> 附近分批佈局。<br>"
+            f"🛡️ <b>風險控管 (停損預估)：</b><br>"
+            f"• 初始防禦 (觸發即撤)：<b>{init_stop}</b><br>"
+            f"• 強勢持有線 (10MA)：<b>{ma10}</b><br>"
+            f"• 最後防線 (20MA)：<b>{ma20}</b><br><br>"
+            f"<hr style='border:0.5px dashed #ddd;'>"
+        )
+        return diagnostic
+    except:
+        return f"【{row_c['名稱']}】數據解析異常，跳過診斷。<br>"
 
 def send_email(h, c, d):
     df_h, df_c, df_d = pd.DataFrame(h), pd.DataFrame(c), pd.DataFrame(d)
@@ -191,7 +208,10 @@ def send_email(h, c, d):
         for tid in inter_ids:
             row_c = df_c[df_c['代號'] == tid].iloc[0]
             row_d = df_d[df_d['代號'] == tid].iloc[0]
-            ai_section += generate_ai_diagnostic(row_c, row_d)
+
+            # --- 為了獲取 MA 數值，這裡需重新下載該股數據或從主程式傳遞 ---
+            df_temp = yf.download(tid, period='60d', progress=False, auto_adjust=True)
+            ai_section += generate_ai_diagnostic(row_c, row_d, df_temp)
 
     style = """
     <style>
@@ -235,4 +255,5 @@ def send_email(h, c, d):
 if __name__ == "__main__":
     system = StockSystem()
     h, c, d = system.run()
+
     send_email(h, c, d); print("Done!")
