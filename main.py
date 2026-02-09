@@ -245,27 +245,21 @@ def backtest_3y_strategy(ticker, bench_roc_series):
 # ==========================================
 # 📧 郵件發送與 AI 深度診斷文字引擎
 # ==========================================
-def generate_ai_diagnostic(row_c, row_d, df, bench_series):
+def generate_ai_diagnostic(row_c, row_d, df):
     """
     根據量化數據產出 AI 深度點評文字
-    包含：原始診斷、精確停損、3年同步回測、績優生標記
+    包含：原始診斷、精確停損
     """
     try:
         close = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
         
-        # 1. 計算各類停損價格
+        # 計算各類停損價格
         buy_price = row_c['建議買價']
         init_stop = round(buy_price * 0.93, 2)  # 初始停損設為 -7%
         ma10 = round(float(close.rolling(10).mean().iloc[-1]), 2)
         ma20 = round(float(close.rolling(20).mean().iloc[-1]), 2)
 
-        # 2. 執行 3 年同步回測 (進場：analyze_chose | 出場：health_check_logic)
-        win_rate, cumulative_ret = backtest_3y_strategy(row_c['代號'], bench_series)
-
-        # 3. 歷史績優生判定 (勝率 > 60% 且報酬 > 50%)
-        star_tag = "<b style='color:#f1c40f;'>🌟 歷史績優生</b>" if win_rate >= 60 and cumulative_ret > 50 else ""
-
-        # 4. 判斷目前防線 (同步考特賣出法則之 MA 選擇)
+        #  判斷目前防線 (同步考特賣出法則之 MA 選擇)
         is_super = (close.iloc[-35:] > close.rolling(10).mean().iloc[-35:]).all()
         defense_ma_name = "10MA" if is_super else "20MA"
         defense_ma_val = ma10_val if is_super else ma20_val
@@ -274,7 +268,6 @@ def generate_ai_diagnostic(row_c, row_d, df, bench_series):
             f"<b>【{row_c['名稱']} ({row_c['代號'].split('.')[0]})】</b> {star_tag}<br>"
             f"➡️ <b>診斷結論：</b> 該股觸發了 <b>{row_c['型態']}</b>，顯示出極強的買入契機。其 DRIVE 綜合評分高達 <b>{row_d['評分']} 分</b>，"
             f"RS 強度達 <b>{row_d['RS']}</b>，不僅強於大盤，更是 {row_d['產業']} 板塊中的領頭羊。<br>"
-            f"📊 <b>策略回測 (3Y)：</b> 勝率 <b style='color:#27ae60;'>{win_rate}%</b> | 總報酬 <b style='color:#27ae60;'>{cumulative_ret}%</b><br>"
             f"✅ <b>技術特徵：</b> 具備 <b>{row_d['吸籌特徵']}</b>，大戶吸籌跡象明顯。<br>"
             f"📍 <b>佈局建議：</b> 建議在 <b>{buy_price}</b> 附近分批佈局。<br>"
             f"🛡️ <b>風險控控 (停損預估)：</b><br>"
@@ -290,10 +283,6 @@ def generate_ai_diagnostic(row_c, row_d, df, bench_series):
 
 def send_email(h, c, d):
     df_h, df_c, df_d = pd.DataFrame(h), pd.DataFrame(c), pd.DataFrame(d)
-    # 回測所需的資料
-    bench_df = yf.download('0050.TW', period='4y', progress=False, auto_adjust=True)
-    b_close = bench_df['Close'].iloc[:, 0] if isinstance(bench_df['Close'], pd.DataFrame) else bench_df['Close']
-    bench_series = b_close.pct_change(20).to_dict()
 
     # 產業分析與雙重認證個股
     top_ind = df_d['產業'].value_counts().head(3).index.tolist() if not df_d.empty else []
@@ -306,7 +295,7 @@ def send_email(h, c, d):
 
             # --- 為了獲取 MA 數值，這裡需重新下載該股數據或從主程式傳遞 ---
             df_temp = yf.download(tid, period='60d', progress=False, auto_adjust=True)
-            ai_section += generate_ai_diagnostic(row_c, row_d, df_temp, bench_series)
+            ai_section += generate_ai_diagnostic(row_c, row_d, df_temp)
 
     style = """
     <style>
@@ -352,4 +341,5 @@ if __name__ == "__main__":
     h, c, d = system.run()
 
     send_email(h, c, d); print("Done!")
+
 
