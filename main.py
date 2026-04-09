@@ -26,7 +26,7 @@ RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL')
 class StockSystem:
     def __init__(self):
         self.bench_ticker = '0050.TW'
-        self.min_price = 20
+        self.min_price = 5
         self.min_volume_chose = 800000
         self.min_volume_drive = 1000000
         self.rs_period_chose = 20
